@@ -3,7 +3,7 @@ const chatModel = require('../models/chat.model.js')
 
 async function createChat(req,res){
     const {title} = req.body;
-    console.log(title)
+    
     const user = req.user
 
     const chat = await chatModel.create({
