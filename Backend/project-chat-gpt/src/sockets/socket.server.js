@@ -31,26 +31,31 @@ function initSocketServer(httpServer) {
       try {
         const { chatId, message } = data;
 
-        // 4. Save current user message to MongoDB
-        const userMessage = await Message.create({
-          chatId,
-          role: "user",
-          content: message,
-        })
+        const vectorsPromise = generateVector(message);
 
+        const [chatHistory, memory, userMessage, vectors] = await Promise.all([
+          // finding last 10 msg for stm
+          Message.find({ chatId }).sort({ createdAt: -1 }).limit(10),
+          // generating new msg vectors and finding ltm for that msg
+          vectorsPromise.then((vecs) =>
+            queryMemory({
+              queryVector: vecs,
+              limit: 3,
+              metadata: { user: socket.user._id.toString() }
+            })
+          ),
+          // saving that msg in mongodb
+          Message.create({
+            chatId,
+            role: "user",
+            content: message
+          }),
+          // resolving vectors to use in createMemory below
+          vectorsPromise
+        ]);
 
-        const vectors = await generateVector(message)
-
-        const memory = await queryMemory({
-          queryVector: vectors,
-          limit: 3,
-          metadata: {
-            user: socket.user._id.toString()
-          }
-        })
-
-        // users prompt saving in vector database
-        await createMemory({
+        // Fire-and-forget (won't block the AI response)
+        createMemory({
           vectors,
           messageId: userMessage._id.toString(),
           metadata: {
@@ -59,17 +64,7 @@ function initSocketServer(httpServer) {
             role: 'user',
             message
           }
-        })
-
-        console.log(memory)
-
-        // 1. Fetch previous messages for short-term memory (e.g., last 10)
-        const chatHistory = await Message.find({
-          chatId,
-          _id: { $ne: userMessage._id }
-        })
-          .sort({ createdAt: -1 })
-          .limit(10);
+        }).catch((err) => console.error("Background LTM save error:", err));
 
         chatHistory.reverse();
 
@@ -98,32 +93,35 @@ function initSocketServer(httpServer) {
           systemInstruction
         });
 
-        // 5. Save the AI response
+        // 1. Save in Mongo
         const responseAiMessage = await Message.create({
           chatId,
           role: "model",
-          content: aiResponseText,
+          content: aiResponseText
         });
 
-        const vectorAiResponse = await generateVector(aiResponseText)
-
-        // ai response saving in vector database
-        await createMemory({
-          vectors: vectorAiResponse,
-          messageId: responseAiMessage._id.toString(),
-          metadata: {
-            chat: chatId,
-            user: socket.user._id,
-            role: 'model',
-            message: aiResponseText
-          }
-        })
-
-        // 6. Emit to socket client
+        // 2. Deliver to user immediately!
         socket.emit("ai-response", {
           chatId,
-          message: responseAiMessage,
+          message: responseAiMessage
         });
+
+        // 3. Vectorize & save to Pinecone in the background
+        generateVector(aiResponseText)
+          .then((aiVector) =>
+            createMemory({
+              vectors: aiVector,
+              messageId: responseAiMessage._id.toString(),
+              metadata: {
+                chat: chatId,
+                user: socket.user._id.toString(),
+                role: 'model',
+                message: aiResponseText
+              }
+            })
+          )
+          .catch((err) => console.error("Error saving AI vector:", err));
+
       } catch (error) {
         console.error("Error generating AI response:", error.message);
         socket.emit("error", { message: "Failed to generate response" });
