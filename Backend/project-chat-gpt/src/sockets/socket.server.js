@@ -79,10 +79,10 @@ function initSocketServer(httpServer) {
 
         chatHistory.reverse();
 
-        // 2. Transform into Gemini's expected format
+        // 2. Transform into Gemini Interactions API expected step format
         const stm = chatHistory.map((msg) => ({
-          role: msg.role === "user" ? "user" : "model",
-          parts: [{ text: msg.content }],
+          type: msg.role === "user" ? "user_input" : "model_output",
+          content: [{ type: "text", text: msg.content }],
         }));
 
         // 3. Build system instruction with high-confidence LTM context only (score >= 0.70)

@@ -2,34 +2,32 @@ const { GoogleGenAI } = require("@google/genai");
 
 const ai = new GoogleGenAI({});
 
-// async function generateGoogleAiResponse({history,prompt}) {
-//   const interaction = await ai.interactions.create({
-//     model: "gemini-3.5-flash-lite",
-//     input:history,
-//     store:false
-//   });
-
-//   return interaction.output_text;
-// }
-
-async function generateAIResponse({ history = [], prompt,systemInstruction }) {
-  const contents = [
-    ...history,
+async function generateAIResponse({ history = [], prompt, systemInstruction }) {
+  const steps = [
+    ...history.map((msg) => {
+      if (msg.type && msg.content) {
+        return msg;
+      }
+      const text = msg.content || (msg.parts && msg.parts[0]?.text) || "";
+      return {
+        type: msg.role === "user" ? "user_input" : "model_output",
+        content: [{ type: "text", text }],
+      };
+    }),
     {
-      role: "user",
-      parts: [{ text: prompt }],
+      type: "user_input",
+      content: [{ type: "text", text: prompt }],
     },
   ];
 
-  const response = await ai.models.generateContent({
+  const interaction = await ai.interactions.create({
     model: "gemini-3.5-flash-lite",
-    contents,
-    config:{
-      systemInstruction:systemInstruction || undefined
-    }
+    input: steps,
+    system_instruction: systemInstruction || undefined,
+    store: false,
   });
 
-  return response.text;
+  return interaction.output_text;
 }
 
 async function generateVector(content){
