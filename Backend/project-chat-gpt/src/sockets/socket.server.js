@@ -2,7 +2,7 @@ const { Server } = require("socket.io");
 const cookie = require("cookie");
 const { verify } = require("jsonwebtoken");
 const userModel = require("../models/user.model.js");
-const { generateAIResponse, generateVector } = require("../services/ai.service.js")
+const { generateAIResponse, generateAIResponseStream, generateVector } = require("../services/ai.service.js");
 const Message = require("../models/messsage.model.js");
 const { createMemory, queryMemory } = require('../services/vector.service.js')
 
@@ -99,24 +99,33 @@ function initSocketServer(httpServer) {
           }
         }
 
-        // 4. Generate AI response (passing history + user prompt)
-        const aiResponseText = await generateAIResponse({
+        // 4. Stream AI response chunks in real-time
+        let fullResponseText = "";
+        const responseStream = generateAIResponseStream({
           history: stm,
           prompt: message,
-          systemInstruction
+          systemInstruction,
         });
 
-        // 1. Save in Mongo
+        for await (const chunk of responseStream) {
+          fullResponseText += chunk;
+          socket.emit("ai-response-chunk", {
+            chatId,
+            chunk,
+          });
+        }
+
+        // 5. Save the complete message once in MongoDB
         const responseAiMessage = await Message.create({
           chatId,
           role: "model",
-          content: aiResponseText
+          content: fullResponseText,
         });
 
-        // 2. Deliver to user immediately!
-        socket.emit("ai-response", {
+        // 6. Signal stream completion with the final saved message document
+        socket.emit("ai-response-end", {
           chatId,
-          message: responseAiMessage
+          message: responseAiMessage,
         });
 
       } catch (error) {
