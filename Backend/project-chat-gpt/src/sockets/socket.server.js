@@ -31,40 +31,51 @@ function initSocketServer(httpServer) {
       try {
         const { chatId, message } = data;
 
+        // 1. Check if the message has substance (skip pure greetings / empty acknowledgments)
+        const isGreeting = /^(hi|hello|hey|ok|okay|bye|thanks|thank you|good morning|good night)$/i.test(message.trim());
+        const hasSubstance = message.trim().length > 8 && !isGreeting;
+
         const vectorsPromise = generateVector(message);
 
         const [chatHistory, memory, userMessage, vectors] = await Promise.all([
           // finding last 10 msg for stm
           Message.find({ chatId }).sort({ createdAt: -1 }).limit(10),
-          // generating new msg vectors and finding ltm for that msg
-          vectorsPromise.then((vecs) =>
-            queryMemory({
-              queryVector: vecs,
-              limit: 3,
-              metadata: { user: socket.user._id.toString() }
-            })
-          ),
-          // saving that msg in mongodb
+
+          // Only query Pinecone if message is not a pure greeting
+          !isGreeting
+            ? vectorsPromise.then((vecs) =>
+                queryMemory({
+                  queryVector: vecs,
+                  limit: 3,
+                  metadata: { user: socket.user._id.toString() }
+                })
+              )
+            : Promise.resolve([]),
+
+          // saving user message in mongodb
           Message.create({
             chatId,
             role: "user",
             content: message
           }),
+
           // resolving vectors to use in createMemory below
           vectorsPromise
         ]);
 
-        // Fire-and-forget (won't block the AI response)
-        createMemory({
-          vectors,
-          messageId: userMessage._id.toString(),
-          metadata: {
-            chat: chatId,
-            user: socket.user._id.toString(),
-            role: 'user',
-            message
-          }
-        }).catch((err) => console.error("Background LTM save error:", err));
+        // Save to Pinecone ONLY if the user message has substance (skips greetings / noise)
+        if (hasSubstance) {
+          createMemory({
+            vectors,
+            messageId: userMessage._id.toString(),
+            metadata: {
+              chat: chatId,
+              user: socket.user._id.toString(),
+              role: 'user',
+              message
+            }
+          }).catch((err) => console.error("Background LTM save error:", err));
+        }
 
         chatHistory.reverse();
 
@@ -72,15 +83,17 @@ function initSocketServer(httpServer) {
         const stm = chatHistory.map((msg) => ({
           role: msg.role === "user" ? "user" : "model",
           parts: [{ text: msg.content }],
-        }))
+        }));
 
-        // 3. Build system instruction with LTM context (no fake user messages)
+        // 3. Build system instruction with high-confidence LTM context only (score >= 0.70)
         let systemInstruction = "You are a helpful AI assistant.";
         if (memory && memory.length > 0) {
-          const memoriesText = memory
+          const relevantMemories = memory.filter((item) => typeof item.score === "number" ? item.score >= 0.7 : true);
+          const memoriesText = relevantMemories
             .map((item) => item.metadata?.message)
             .filter(Boolean)
             .join("\n");
+
           if (memoriesText) {
             systemInstruction += `\n\nRelevant past information about this user:\n${memoriesText}\nUse this context when relevant, but do not recite it verbatim.`;
           }
@@ -105,22 +118,6 @@ function initSocketServer(httpServer) {
           chatId,
           message: responseAiMessage
         });
-
-        // 3. Vectorize & save to Pinecone in the background
-        generateVector(aiResponseText)
-          .then((aiVector) =>
-            createMemory({
-              vectors: aiVector,
-              messageId: responseAiMessage._id.toString(),
-              metadata: {
-                chat: chatId,
-                user: socket.user._id.toString(),
-                role: 'model',
-                message: aiResponseText
-              }
-            })
-          )
-          .catch((err) => console.error("Error saving AI vector:", err));
 
       } catch (error) {
         console.error("Error generating AI response:", error.message);
