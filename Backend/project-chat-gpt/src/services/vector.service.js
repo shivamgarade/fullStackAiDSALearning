@@ -7,26 +7,26 @@ const pc = new Pinecone({
 const projectChatGPTIndex = pc.Index('project-chat-gpt')
 
 // save vector in pinecone
-async function createMemory({vectors,metadata,messageId}){
+async function createMemory({ vectors, metadata, messageId }) {
 
     const dataToPinecone = [
         {
-            id:messageId,
-            values:vectors,
+            id: messageId,
+            values: vectors,
             metadata
         }
     ]
-    await projectChatGPTIndex.upsert({records:dataToPinecone})
+    await projectChatGPTIndex.upsert({ records: dataToPinecone })
 }
 
-async function queryMemory({queryVector,limit = 5,metadata}){
+async function queryMemory({ queryVector, limit = 5, metadata }) {
     const data = await projectChatGPTIndex.query({
-        vector:queryVector,
-        topK:limit,
-        filter:metadata ? {metadata} : undefined,
-        includeMetadata:true
+        vector: queryVector,
+        topK: limit,
+        filter: metadata && Object.keys(metadata).length > 0 ? metadata : undefined,
+        includeMetadata: true
     })
     return data.matches;
 }
 
-module.exports = {createMemory , queryMemory}
+module.exports = { createMemory, queryMemory }

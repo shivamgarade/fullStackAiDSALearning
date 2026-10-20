@@ -2,9 +2,9 @@ const { Server } = require("socket.io");
 const cookie = require("cookie");
 const { verify } = require("jsonwebtoken");
 const userModel = require("../models/user.model.js");
-const {generateAIResponse,generateVector} = require("../services/ai.service.js")
+const { generateAIResponse, generateVector } = require("../services/ai.service.js")
 const Message = require("../models/messsage.model.js");
-const {createMemory,queryMemory} = require('../services/vector.service.js')
+const { createMemory, queryMemory } = require('../services/vector.service.js')
 
 function initSocketServer(httpServer) {
   const io = new Server(httpServer, {});
@@ -31,19 +31,6 @@ function initSocketServer(httpServer) {
       try {
         const { chatId, message } = data;
 
-        // 1. Fetch previous messages for short-term memory (e.g., last 10)
-        const rawHistory = await Message.find({ chatId })
-          .sort({ createdAt: -1 })
-          .limit(10);
-
-        rawHistory.reverse();
-
-        // 2. Transform into Gemini's expected format
-        const history = rawHistory.map((msg) => ({
-          role: msg.role === "user" ? "user" : "model",
-          parts: [{ text: msg.content }],
-        }))
-
         // 4. Save current user message to MongoDB
         const userMessage = await Message.create({
           chatId,
@@ -51,31 +38,64 @@ function initSocketServer(httpServer) {
           content: message,
         })
 
+
         const vectors = await generateVector(message)
-        
+
+        const memory = await queryMemory({
+          queryVector: vectors,
+          limit: 3,
+          metadata: {
+            user: socket.user._id.toString()
+          }
+        })
+
         // users prompt saving in vector database
         await createMemory({
           vectors,
-          messageId:userMessage._id.toString(),
-          metadata:{
-            chat:chatId,
-            user:socket.user._id,
-            role:'user',
+          messageId: userMessage._id.toString(),
+          metadata: {
+            chat: chatId,
+            user: socket.user._id.toString(),
+            role: 'user',
             message
           }
         })
 
-        const recentMemories = await queryMemory({
-          queryVector:vectors,
-          limit:3,
-          metadata:{}
+        console.log(memory)
+
+        // 1. Fetch previous messages for short-term memory (e.g., last 10)
+        const chatHistory = await Message.find({
+          chatId,
+          _id: { $ne: userMessage._id }
         })
-        console.log(recentMemories)
+          .sort({ createdAt: -1 })
+          .limit(10);
+
+        chatHistory.reverse();
+
+        // 2. Transform into Gemini's expected format
+        const stm = chatHistory.map((msg) => ({
+          role: msg.role === "user" ? "user" : "model",
+          parts: [{ text: msg.content }],
+        }))
+
+        // 3. Build system instruction with LTM context (no fake user messages)
+        let systemInstruction = "You are a helpful AI assistant.";
+        if (memory && memory.length > 0) {
+          const memoriesText = memory
+            .map((item) => item.metadata?.message)
+            .filter(Boolean)
+            .join("\n");
+          if (memoriesText) {
+            systemInstruction += `\n\nRelevant past information about this user:\n${memoriesText}\nUse this context when relevant, but do not recite it verbatim.`;
+          }
+        }
 
         // 4. Generate AI response (passing history + user prompt)
         const aiResponseText = await generateAIResponse({
-          history,
+          history: stm,
           prompt: message,
+          systemInstruction
         });
 
         // 5. Save the AI response
@@ -89,13 +109,13 @@ function initSocketServer(httpServer) {
 
         // ai response saving in vector database
         await createMemory({
-          vectors:vectorAiResponse,
-          messageId:responseAiMessage._id.toString(),
-          metadata:{
-            chat:chatId,
-            user:socket.user._id,
-            role:'model',
-            message:aiResponseText
+          vectors: vectorAiResponse,
+          messageId: responseAiMessage._id.toString(),
+          metadata: {
+            chat: chatId,
+            user: socket.user._id,
+            role: 'model',
+            message: aiResponseText
           }
         })
 

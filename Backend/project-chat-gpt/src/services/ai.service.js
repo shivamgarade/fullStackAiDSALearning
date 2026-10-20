@@ -12,7 +12,7 @@ const ai = new GoogleGenAI({});
 //   return interaction.output_text;
 // }
 
-async function generateAIResponse({ history = [], prompt }) {
+async function generateAIResponse({ history = [], prompt,systemInstruction }) {
   const contents = [
     ...history,
     {
@@ -24,6 +24,9 @@ async function generateAIResponse({ history = [], prompt }) {
   const response = await ai.models.generateContent({
     model: "gemini-3.5-flash-lite",
     contents,
+    config:{
+      systemInstruction:systemInstruction || undefined
+    }
   });
 
   return response.text;
