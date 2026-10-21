@@ -312,6 +312,37 @@ Instructions:
   }
 }
 
+async function generateTitle(userMsg, aiMsg) {
+  let userText = "";
+  let aiText = "";
+  if (typeof userMsg === "object" && userMsg !== null) {
+    userText = userMsg.userMsg || userMsg.userMessage || "";
+    aiText = userMsg.aiMsg || userMsg.aiMessage || userMsg.aiResponse || "";
+  } else {
+    userText = userMsg || "";
+    aiText = aiMsg || "";
+  }
+
+  const prompt = `Generate a concise 3 to 5 word title summarizing this conversation. Return ONLY the title with no quotes or punctuation: User: ${userText} AI: ${aiText}`;
+
+  try {
+    const interaction = await ai.interactions.create({
+      model: "gemini-3.5-flash-lite",
+      input: prompt,
+    });
+
+    let title = interaction.output_text?.trim() || "";
+    if (title.includes("\n")) {
+      title = title.split("\n").map((l) => l.trim()).filter(Boolean)[0] || "";
+    }
+    title = title.replace(/^["'`*]+|["'`*]+$/g, "").replace(/[.:;!]+$/, "").trim();
+    return title;
+  } catch (error) {
+    console.error("Error generating chat title:", error.message);
+    return null;
+  }
+}
+
 module.exports = {
   generateAIResponse,
   generateAIResponseStream,
@@ -319,5 +350,7 @@ module.exports = {
   searchMemoryTool,
   extractUserFacts,
   summarizeConversation,
+  generateTitle,
+  generateChatTitle: generateTitle,
 };
 

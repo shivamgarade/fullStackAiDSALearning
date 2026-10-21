@@ -3,18 +3,21 @@ const cookie = require("cookie");
 const { verify } = require("jsonwebtoken");
 const userModel = require("../models/user.model.js");
 const chatModel = require("../models/chat.model.js");
+const Chat = chatModel;
 const {
   generateAIResponse,
   generateAIResponseStream,
   generateVector,
   extractUserFacts,
   summarizeConversation,
+  generateTitle,
 } = require("../services/ai.service.js");
 const Message = require("../models/messsage.model.js");
 const { createMemory, queryMemory } = require('../services/vector.service.js')
 
 const activeStreams = new Map();
 const summarizingChats = new Set();
+const titlingChats = new Set();
 
 async function triggerBackgroundSummaryUpdate(chatId, currentTotalCount) {
   const chatIdStr = chatId?.toString ? chatId.toString() : String(chatId);
@@ -68,6 +71,26 @@ async function triggerBackgroundSummaryUpdate(chatId, currentTotalCount) {
     console.error("Error updating context summary in background:", err.message);
   } finally {
     summarizingChats.delete(chatIdStr);
+  }
+}
+
+async function triggerBackgroundChatTitling({ chatId, userMsg, aiMsg, socket }) {
+  const chatIdStr = chatId?.toString ? chatId.toString() : String(chatId);
+  if (titlingChats.has(chatIdStr)) {
+    return;
+  }
+  titlingChats.add(chatIdStr);
+
+  try {
+    const generatedTitle = await generateTitle(userMsg, aiMsg);
+    if (generatedTitle) {
+      await Chat.findByIdAndUpdate(chatId, { title: generatedTitle });
+      socket.emit("chat-renamed", { chatId, title: generatedTitle });
+    }
+  } catch (err) {
+    console.error("Background chat titling error:", err.message);
+  } finally {
+    titlingChats.delete(chatIdStr);
   }
 }
 
@@ -328,7 +351,29 @@ function initSocketServer(httpServer) {
         // 7. Transition status to idle
         socket.emit("ai-status", { chatId, status: "idle" });
 
-        // 8. Background Workers (Non-blocking): Context Summarization & Fact Extraction
+        // 8. Automated Background Chat Titling after Turn 1
+        const messageCount = await Message.countDocuments({ chatId });
+        if (messageCount === 2) {
+          const chatDoc = await Chat.findById(chatId).lean();
+          if (chatDoc && (!chatDoc.title || !chatDoc.title.trim() || chatDoc.title.trim() === "New Chat")) {
+            const chatMessages = await Message.find({ chatId }, { role: 1, content: 1 })
+              .sort({ _id: 1 })
+              .lean();
+            if (
+              chatMessages.length === 2 &&
+              chatMessages[0].role === "user" &&
+              chatMessages[1].role === "model"
+            ) {
+              const userMsg = chatMessages[0].content;
+              const aiMsg = chatMessages[1].content;
+              triggerBackgroundChatTitling({ chatId, userMsg, aiMsg, socket }).catch((err) =>
+                console.error("Background titling trigger error:", err.message)
+              );
+            }
+          }
+        }
+
+        // 9. Background Workers (Non-blocking): Context Summarization & Fact Extraction
         triggerBackgroundSummaryUpdate(chatId).catch((err) =>
           console.error("Background context summary error:", err.message)
         );
