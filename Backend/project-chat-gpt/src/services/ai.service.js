@@ -67,93 +67,120 @@ async function* generateAIResponseStream({
   systemInstruction,
   tools = [searchMemoryTool],
   onFunctionCall,
+  signal,
 }) {
   const steps = formatSteps({ history, prompt });
   const activeTools = Array.isArray(tools) && tools.length > 0 ? tools : undefined;
 
   let currentInput = steps;
   let previousId = null;
-  while (true) {
-    const stream = await ai.interactions.create({
-      model: "gemini-3.5-flash-lite",
-      input: currentInput,
-      previous_interaction_id: previousId,
-      system_instruction: systemInstruction || undefined,
-      tools: activeTools,
-      stream: true,
-      generation_config: {
-        thinking_summaries: "auto",
-      },
-    });
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        break;
+      }
 
-    let functionCall = null;
-    let partialArgs = "";
+      const stream = await ai.interactions.create(
+        {
+          model: "gemini-3.5-flash-lite",
+          input: currentInput,
+          previous_interaction_id: previousId,
+          system_instruction: systemInstruction || undefined,
+          tools: activeTools,
+          stream: true,
+          generation_config: {
+            thinking_summaries: "auto",
+          },
+        },
+        signal ? { signal } : undefined
+      );
 
-    for await (const event of stream) {
-      if (event.event_type === "interaction.created" && event.interaction?.id) {
-        previousId = event.interaction.id;
-      }
-      if (event.event_type === "interaction.status_update" && event.interaction_id) {
-        if (!previousId) previousId = event.interaction_id;
-      }
-      if (event.event_type === "step.start" && event.step?.type === "function_call") {
-        functionCall = {
-          id: event.step.id,
-          name: event.step.name,
-          arguments: event.step.arguments || {},
-        };
-      }
-      if (event.event_type === "step.delta") {
-        if (event.delta?.type === "arguments_delta" || event.delta?.type === "arguments") {
-          partialArgs += event.delta.arguments || event.delta.partial_arguments || "";
-        } else if (event.delta?.type === "thought_summary" || event.delta?.type === "thought") {
-          const thoughtText =
-            event.delta.content?.text ||
-            (typeof event.delta.content === "string" ? event.delta.content : "") ||
-            event.delta.text ||
-            "";
-          if (thoughtText) {
-            yield { type: "thought", text: thoughtText };
+      let functionCall = null;
+      let partialArgs = "";
+
+      for await (const event of stream) {
+        if (signal?.aborted) {
+          break;
+        }
+        if (event.event_type === "interaction.created" && event.interaction?.id) {
+          previousId = event.interaction.id;
+        }
+        if (event.event_type === "interaction.status_update" && event.interaction_id) {
+          if (!previousId) previousId = event.interaction_id;
+        }
+        if (event.event_type === "step.start" && event.step?.type === "function_call") {
+          functionCall = {
+            id: event.step.id,
+            name: event.step.name,
+            arguments: event.step.arguments || {},
+          };
+        }
+        if (event.event_type === "step.delta") {
+          if (event.delta?.type === "arguments_delta" || event.delta?.type === "arguments") {
+            partialArgs += event.delta.arguments || event.delta.partial_arguments || "";
+          } else if (event.delta?.type === "thought_summary" || event.delta?.type === "thought") {
+            const thoughtText =
+              event.delta.content?.text ||
+              (typeof event.delta.content === "string" ? event.delta.content : "") ||
+              event.delta.text ||
+              "";
+            if (thoughtText) {
+              yield { type: "thought", text: thoughtText };
+            }
+          } else if (event.delta?.type === "text" && event.delta?.text) {
+            yield { type: "text", text: event.delta.text };
           }
-        } else if (event.delta?.type === "text" && event.delta?.text) {
-          yield { type: "text", text: event.delta.text };
+        }
+        if (event.event_type === "interaction.completed" && event.interaction?.id) {
+          previousId = event.interaction.id;
         }
       }
-      if (event.event_type === "interaction.completed" && event.interaction?.id) {
-        previousId = event.interaction.id;
+
+      if (signal?.aborted || !functionCall) {
+        break;
       }
-    }
 
-    if (!functionCall) {
-      break;
-    }
-
-    if (partialArgs) {
-      try {
-        functionCall.arguments = JSON.parse(partialArgs);
-      } catch (err) {
-        console.error("Error parsing function call arguments:", err.message);
+      if (partialArgs) {
+        try {
+          functionCall.arguments = JSON.parse(partialArgs);
+        } catch (err) {
+          console.error("Error parsing function call arguments:", err.message);
+        }
       }
-    }
 
-    let toolResult;
-    if (typeof onFunctionCall === "function") {
-      toolResult = await onFunctionCall(functionCall);
-    } else {
-      toolResult = yield functionCall;
-    }
+      let toolResult;
+      if (typeof onFunctionCall === "function") {
+        toolResult = await onFunctionCall(functionCall);
+      } else {
+        toolResult = yield functionCall;
+      }
 
-    currentInput = [
-      {
-        type: "function_result",
-        call_id: functionCall.id,
-        name: functionCall.name,
-        result:
-          typeof toolResult === "string"
-            ? [{ type: "text", text: toolResult }]
-            : [{ type: "text", text: JSON.stringify(toolResult ?? "") }],
-      },
-    ];
+      if (signal?.aborted) {
+        break;
+      }
+
+      currentInput = [
+        {
+          type: "function_result",
+          call_id: functionCall.id,
+          name: functionCall.name,
+          result:
+            typeof toolResult === "string"
+              ? [{ type: "text", text: toolResult }]
+              : [{ type: "text", text: JSON.stringify(toolResult ?? "") }],
+        },
+      ];
+    }
+  } catch (err) {
+    if (
+      signal?.aborted ||
+      err.name === "AbortError" ||
+      err.name === "APIUserAbortError" ||
+      err.message?.toLowerCase().includes("abort")
+    ) {
+      return;
+    }
+    throw err;
   }
 }
 

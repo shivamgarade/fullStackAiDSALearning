@@ -13,12 +13,19 @@ const messageSchema = new mongoose.Schema({
     },
     content:{
         type:String,
-        required:true
+        required: function() {
+            return !this.stopped;
+        },
+        default: ""
     },
     role:{
         type:String,
         enum:["user","model","system"],
         default:"user"
+    },
+    stopped:{
+        type:Boolean,
+        default:false
     }
 },{
     timestamps:true

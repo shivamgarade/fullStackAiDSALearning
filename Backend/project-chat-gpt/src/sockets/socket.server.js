@@ -6,6 +6,8 @@ const { generateAIResponse, generateAIResponseStream, generateVector, extractUse
 const Message = require("../models/messsage.model.js");
 const { createMemory, queryMemory } = require('../services/vector.service.js')
 
+const activeStreams = new Map();
+
 function initSocketServer(httpServer) {
   const io = new Server(httpServer, {});
 
@@ -26,16 +28,40 @@ function initSocketServer(httpServer) {
   });
 
   io.on("connection", (socket) => {
+    socket.on("stop-generation", ({ chatId }) => {
+      if (!chatId) return;
+      const streamKey = chatId?.toString ? chatId.toString() : chatId;
+      const controller = activeStreams.get(streamKey);
+      if (controller) {
+        controller.abort();
+        activeStreams.delete(streamKey);
+      }
+    });
+
     // listner for accepting single user data
     socket.on("ai-message", async (data) => {
+      const { chatId, message } = data || {};
+      const trimmedMessage = (message || "").trim();
+
+      if (!trimmedMessage || !chatId) {
+        return;
+      }
+
+      const streamKey = chatId?.toString ? chatId.toString() : chatId;
+
+      // Abort any existing stream for this chatId if already active
+      if (activeStreams.has(streamKey)) {
+        activeStreams.get(streamKey).abort();
+        activeStreams.delete(streamKey);
+      }
+
+      const abortController = new AbortController();
+      activeStreams.set(streamKey, abortController);
+
+      let fullResponseText = "";
+      let wasStopped = false;
+
       try {
-        const { chatId, message } = data;
-        const trimmedMessage = (message || "").trim();
-
-        if (!trimmedMessage) {
-          return;
-        }
-
         // 1. Asynchronously persist user message in MongoDB (Fire-and-forget, non-blocking)
         Message.create({
           chatId,
@@ -48,6 +74,11 @@ function initSocketServer(httpServer) {
           .sort({ _id: -1 })
           .limit(10)
           .lean();
+
+        if (abortController.signal.aborted) {
+          socket.emit("ai-status", { chatId, status: "idle" });
+          return;
+        }
 
         chatHistory.reverse();
 
@@ -63,14 +94,18 @@ function initSocketServer(httpServer) {
         socket.emit("ai-status", { chatId, status: "thinking" });
 
         // 5. Stream AI response with On-Demand Memory Retrieval (Tool Calling)
-        let fullResponseText = "";
         let currentStatus = "thinking";
 
         const responseStream = generateAIResponseStream({
           history: stm,
           prompt: trimmedMessage,
           systemInstruction,
+          signal: abortController.signal,
           onFunctionCall: async (call) => {
+            if (abortController.signal.aborted) {
+              return "Operation aborted.";
+            }
+
             if (call.name === "search_memory") {
               socket.emit("ai-status", {
                 chatId,
@@ -116,40 +151,76 @@ function initSocketServer(httpServer) {
           },
         });
 
-        for await (const item of responseStream) {
-          if (typeof item === "string") {
-            // Backwards compatibility for plain string chunks
-            if (currentStatus !== "responding") {
-              currentStatus = "responding";
-              socket.emit("ai-status", { chatId, status: "responding" });
+        try {
+          for await (const item of responseStream) {
+            if (abortController.signal.aborted) {
+              wasStopped = true;
+              break;
             }
-            fullResponseText += item;
-            socket.emit("ai-response-chunk", {
-              chatId,
-              chunk: item,
-            });
-          } else if (item && typeof item === "object") {
-            if (item.type === "thought") {
-              if (currentStatus !== "thinking") {
-                currentStatus = "thinking";
-                socket.emit("ai-status", { chatId, status: "thinking" });
-              }
-              socket.emit("ai-thought-chunk", {
-                chatId,
-                chunk: item.text,
-              });
-            } else if (item.type === "text") {
+            if (typeof item === "string") {
+              // Backwards compatibility for plain string chunks
               if (currentStatus !== "responding") {
                 currentStatus = "responding";
                 socket.emit("ai-status", { chatId, status: "responding" });
               }
-              fullResponseText += item.text;
+              fullResponseText += item;
               socket.emit("ai-response-chunk", {
                 chatId,
-                chunk: item.text,
+                chunk: item,
               });
+            } else if (item && typeof item === "object") {
+              if (item.type === "thought") {
+                if (currentStatus !== "thinking") {
+                  currentStatus = "thinking";
+                  socket.emit("ai-status", { chatId, status: "thinking" });
+                }
+                socket.emit("ai-thought-chunk", {
+                  chatId,
+                  chunk: item.text,
+                });
+              } else if (item.type === "text") {
+                if (currentStatus !== "responding") {
+                  currentStatus = "responding";
+                  socket.emit("ai-status", { chatId, status: "responding" });
+                }
+                fullResponseText += item.text;
+                socket.emit("ai-response-chunk", {
+                  chatId,
+                  chunk: item.text,
+                });
+              }
             }
           }
+        } catch (streamError) {
+          if (
+            abortController.signal.aborted ||
+            streamError.name === "AbortError" ||
+            streamError.name === "APIUserAbortError" ||
+            streamError.message?.toLowerCase().includes("abort")
+          ) {
+            wasStopped = true;
+          } else {
+            throw streamError;
+          }
+        }
+
+        if (wasStopped || abortController.signal.aborted) {
+          // Save whatever partial text was generated up to this moment with stopped: true
+          const partialMessage = await Message.create({
+            chatId,
+            role: "model",
+            content: fullResponseText,
+            stopped: true,
+          });
+
+          socket.emit("ai-response-end", {
+            chatId,
+            message: partialMessage,
+            stopped: true,
+          });
+
+          socket.emit("ai-status", { chatId, status: "idle" });
+          return;
         }
 
         // 5. Save the complete message once in MongoDB (thoughts are NOT saved)
@@ -196,9 +267,35 @@ function initSocketServer(httpServer) {
         })();
 
       } catch (error) {
-        console.error("Error generating AI response:", error.message);
-        socket.emit("ai-status", { chatId: data?.chatId, status: "idle" });
-        socket.emit("error", { message: "Failed to generate response" });
+        if (
+          abortController?.signal?.aborted ||
+          error.name === "AbortError" ||
+          error.name === "APIUserAbortError" ||
+          error.message?.toLowerCase().includes("abort")
+        ) {
+          try {
+            const partialMessage = await Message.create({
+              chatId,
+              role: "model",
+              content: fullResponseText,
+              stopped: true,
+            });
+            socket.emit("ai-response-end", {
+              chatId,
+              message: partialMessage,
+              stopped: true,
+            });
+          } catch (saveErr) {
+            console.error("Error saving stopped message:", saveErr.message);
+          }
+          socket.emit("ai-status", { chatId, status: "idle" });
+        } else {
+          console.error("Error generating AI response:", error.message);
+          socket.emit("ai-status", { chatId: data?.chatId, status: "idle" });
+          socket.emit("error", { message: "Failed to generate response" });
+        }
+      } finally {
+        activeStreams.delete(streamKey);
       }
     });
   });
