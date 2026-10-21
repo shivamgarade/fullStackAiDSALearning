@@ -161,5 +161,82 @@ async function generateVector(content){
   return response.embeddings[0].values
 }
 
-module.exports = { generateAIResponse, generateAIResponseStream, generateVector, searchMemoryTool }
+const factExtractionSchema = {
+  type: "object",
+  properties: {
+    facts: {
+      type: "array",
+      description: "List of permanent facts about the user extracted from the conversation turn. Empty if none.",
+      items: {
+        type: "object",
+        properties: {
+          fact: {
+            type: "string",
+            description: "A clear, concise, standalone declarative fact about the user (e.g. 'User is a backend developer').",
+          },
+          category: {
+            type: "string",
+            enum: ["identity", "preference", "project", "skill"],
+            description: "The category that best describes this fact.",
+          },
+        },
+        required: ["fact", "category"],
+      },
+    },
+  },
+  required: ["facts"],
+};
+
+async function extractUserFacts(userMessage, aiResponse) {
+  if (!userMessage || typeof userMessage !== "string" || !userMessage.trim()) {
+    return { facts: [] };
+  }
+
+  const prompt = `Analyze the following conversation turn between a User and an AI Assistant.
+Extract any permanent, enduring facts about the USER (such as their identity, preferences, active projects, or skills).
+
+Guidelines:
+- Only extract personal facts explicitly revealed or confirmed about the user.
+- Do NOT extract questions (e.g. "Can you remember my name?"), conversational filler, greetings, or temporary tasks.
+- If the user is merely asking a question, greeting, or chatting without stating anything permanent about themselves, return an empty facts array.
+- Formulate each fact as a clear, standalone declarative statement (e.g., "User's name is Shivam", "User is a backend developer").
+
+User Message: "${userMessage.trim()}"
+AI Response: "${aiResponse || ""}"`;
+
+  try {
+    const interaction = await ai.interactions.create({
+      model: "gemini-3.5-flash-lite",
+      input: prompt,
+      system_instruction: "You are an expert fact extraction engine for a long-term memory system. Extract clean, permanent user facts in structured JSON.",
+      response_format: {
+        type: "text",
+        mime_type: "application/json",
+        schema: factExtractionSchema,
+      },
+    });
+
+    const outputText = interaction.output_text;
+    if (!outputText) {
+      return { facts: [] };
+    }
+
+    const parsed = JSON.parse(outputText);
+    if (parsed && Array.isArray(parsed.facts)) {
+      return parsed;
+    }
+    return { facts: [] };
+  } catch (error) {
+    console.error("Error extracting user facts:", error.message);
+    return { facts: [] };
+  }
+}
+
+module.exports = {
+  generateAIResponse,
+  generateAIResponseStream,
+  generateVector,
+  searchMemoryTool,
+  extractUserFacts,
+};
 

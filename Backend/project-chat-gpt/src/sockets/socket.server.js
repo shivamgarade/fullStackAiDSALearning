@@ -2,7 +2,7 @@ const { Server } = require("socket.io");
 const cookie = require("cookie");
 const { verify } = require("jsonwebtoken");
 const userModel = require("../models/user.model.js");
-const { generateAIResponse, generateAIResponseStream, generateVector } = require("../services/ai.service.js");
+const { generateAIResponse, generateAIResponseStream, generateVector, extractUserFacts } = require("../services/ai.service.js");
 const Message = require("../models/messsage.model.js");
 const { createMemory, queryMemory } = require('../services/vector.service.js')
 
@@ -37,41 +37,11 @@ function initSocketServer(httpServer) {
         }
 
         // 1. Asynchronously persist user message in MongoDB (Fire-and-forget, non-blocking)
-        const userMessagePromise = Message.create({
+        Message.create({
           chatId,
           role: "user",
           content: trimmedMessage,
         }).catch((err) => console.error("Error saving user message to MongoDB:", err.message));
-
-        // 2. Determine substance for long-term memory
-        const isGreeting = /^(hi|hello|hey|ok|okay|bye|thanks|thank you|good morning|good night)$/i.test(trimmedMessage);
-        const hasSubstance = trimmedMessage.length > 8 && !isGreeting;
-
-        // 3. Asynchronously persist to Pinecone (Fire-and-forget, non-blocking)
-        if (hasSubstance) {
-          (async () => {
-            try {
-              const [userMsgDoc, vectors] = await Promise.all([
-                userMessagePromise,
-                generateVector(trimmedMessage),
-              ]);
-              if (userMsgDoc && vectors) {
-                await createMemory({
-                  vectors,
-                  messageId: userMsgDoc._id.toString(),
-                  metadata: {
-                    chat: chatId,
-                    user: socket.user._id.toString(),
-                    role: "user",
-                    message: trimmedMessage,
-                  },
-                });
-              }
-            } catch (err) {
-              console.error("Background LTM save error:", err.message);
-            }
-          })();
-        }
 
         // 4. Fetch Short-Term Memory (STM) from MongoDB
         const chatHistory = await Message.find({ chatId }, { role: 1, content: 1 })
@@ -114,12 +84,13 @@ function initSocketServer(httpServer) {
 
                 const relevantMemories = (memory || []).filter((item) => {
                   // Exclude current message self-matches
-                  if (item.metadata?.message === trimmedMessage) return false;
+                  const memoryContent = item.metadata?.fact || item.metadata?.message;
+                  if (memoryContent === trimmedMessage) return false;
                   return typeof item.score === "number" ? item.score >= 0.60 : true;
                 });
 
                 const memoriesText = relevantMemories
-                  .map((item) => item.metadata?.message)
+                  .map((item) => item.metadata?.fact || item.metadata?.message)
                   .filter(Boolean);
 
                 return memoriesText.length > 0
@@ -154,6 +125,33 @@ function initSocketServer(httpServer) {
           chatId,
           message: responseAiMessage,
         });
+
+        // 7. Background Worker: Fact Extraction for Long-Term Memory (Non-blocking)
+        (async () => {
+          try {
+            const { facts } = await extractUserFacts(trimmedMessage, fullResponseText);
+            if (Array.isArray(facts) && facts.length > 0) {
+              const userId = socket.user._id.toString();
+              for (let i = 0; i < facts.length; i++) {
+                const fact = facts[i];
+                if (!fact || !fact.fact) continue;
+                const vectors = await generateVector(fact.fact);
+                await createMemory({
+                  vectors,
+                  messageId: `${responseAiMessage._id.toString()}_fact_${i}`,
+                  metadata: {
+                    user: userId,
+                    chat: chatId,
+                    fact: fact.fact,
+                    category: fact.category,
+                  },
+                });
+              }
+            }
+          } catch (err) {
+            console.error("Background fact extraction error:", err.message);
+          }
+        })();
 
       } catch (error) {
         console.error("Error generating AI response:", error.message);
