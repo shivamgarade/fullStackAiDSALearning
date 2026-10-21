@@ -2,11 +2,74 @@ const { Server } = require("socket.io");
 const cookie = require("cookie");
 const { verify } = require("jsonwebtoken");
 const userModel = require("../models/user.model.js");
-const { generateAIResponse, generateAIResponseStream, generateVector, extractUserFacts } = require("../services/ai.service.js");
+const chatModel = require("../models/chat.model.js");
+const {
+  generateAIResponse,
+  generateAIResponseStream,
+  generateVector,
+  extractUserFacts,
+  summarizeConversation,
+} = require("../services/ai.service.js");
 const Message = require("../models/messsage.model.js");
 const { createMemory, queryMemory } = require('../services/vector.service.js')
 
 const activeStreams = new Map();
+const summarizingChats = new Set();
+
+async function triggerBackgroundSummaryUpdate(chatId, currentTotalCount) {
+  const chatIdStr = chatId?.toString ? chatId.toString() : String(chatId);
+  if (summarizingChats.has(chatIdStr)) {
+    return;
+  }
+  summarizingChats.add(chatIdStr);
+
+  try {
+    const totalCount =
+      typeof currentTotalCount === "number"
+        ? currentTotalCount
+        : await Message.countDocuments({ chatId });
+
+    if (totalCount <= 10) {
+      return;
+    }
+
+    const chat = await chatModel.findById(chatId);
+    if (!chat) return;
+
+    const olderMessagesCount = totalCount - 10;
+    const lastSummarizedCount = chat.contextSummary ? (chat.lastSummarizedCount || 0) : 0;
+
+    if (lastSummarizedCount >= olderMessagesCount) {
+      return;
+    }
+
+    const newOlderMessages = await Message.find({ chatId }, { role: 1, content: 1 })
+      .sort({ _id: 1 })
+      .skip(lastSummarizedCount)
+      .limit(olderMessagesCount - lastSummarizedCount)
+      .lean();
+
+    if (!newOlderMessages || newOlderMessages.length === 0) {
+      return;
+    }
+
+    const updatedSummary = await summarizeConversation({
+      previousSummary: chat.contextSummary || "",
+      olderMessages: newOlderMessages,
+    });
+
+    if (updatedSummary) {
+      await chatModel.findByIdAndUpdate(chatId, {
+        contextSummary: updatedSummary,
+        lastSummarizedCount: olderMessagesCount,
+      });
+    }
+  } catch (err) {
+    console.error("Error updating context summary in background:", err.message);
+  } finally {
+    summarizingChats.delete(chatIdStr);
+  }
+}
 
 function initSocketServer(httpServer) {
   const io = new Server(httpServer, {});
@@ -62,14 +125,33 @@ function initSocketServer(httpServer) {
       let wasStopped = false;
 
       try {
-        // 1. Asynchronously persist user message in MongoDB (Fire-and-forget, non-blocking)
-        Message.create({
+        // 1. Asynchronously persist user message in MongoDB
+        await Message.create({
           chatId,
           role: "user",
           content: trimmedMessage,
-        }).catch((err) => console.error("Error saving user message to MongoDB:", err.message));
+        });
 
-        // 4. Fetch Short-Term Memory (STM) from MongoDB
+        // 2. Count total messages in chatId and handle rolling context summarization
+        const totalCount = await Message.countDocuments({ chatId });
+        let contextSummary = "";
+
+        if (totalCount > 10) {
+          const chat = await chatModel.findById(chatId).lean();
+          if (chat && chat.contextSummary) {
+            contextSummary = chat.contextSummary;
+          }
+
+          const olderMessagesCount = totalCount - 10;
+          const lastSummarized = (chat && chat.contextSummary) ? (chat.lastSummarizedCount || 0) : 0;
+          if (lastSummarized < olderMessagesCount) {
+            triggerBackgroundSummaryUpdate(chatId, totalCount).catch((err) =>
+              console.error("Background summary update error:", err.message)
+            );
+          }
+        }
+
+        // 3. Fetch Short-Term Memory (STM) from MongoDB (latest 10 messages verbatim)
         const chatHistory = await Message.find({ chatId }, { role: 1, content: 1 })
           .sort({ _id: -1 })
           .limit(10)
@@ -88,7 +170,10 @@ function initSocketServer(httpServer) {
           content: [{ type: "text", text: msg.content }],
         }));
 
-        const systemInstruction = "You are a helpful AI assistant. You have access to user memories and can search them with the search_memory tool when relevant.";
+        let systemInstruction = "You are a helpful AI assistant. You have access to user memories and can search them with the search_memory tool when relevant.";
+        if (contextSummary) {
+          systemInstruction += `\n\nSummary of earlier discussion in this chat: ${contextSummary}`;
+        }
 
         // Emit initial thinking status
         socket.emit("ai-status", { chatId, status: "thinking" });
@@ -220,6 +305,10 @@ function initSocketServer(httpServer) {
           });
 
           socket.emit("ai-status", { chatId, status: "idle" });
+
+          triggerBackgroundSummaryUpdate(chatId).catch((err) =>
+            console.error("Background context summary error:", err.message)
+          );
           return;
         }
 
@@ -239,7 +328,11 @@ function initSocketServer(httpServer) {
         // 7. Transition status to idle
         socket.emit("ai-status", { chatId, status: "idle" });
 
-        // 8. Background Worker: Fact Extraction for Long-Term Memory (Non-blocking)
+        // 8. Background Workers (Non-blocking): Context Summarization & Fact Extraction
+        triggerBackgroundSummaryUpdate(chatId).catch((err) =>
+          console.error("Background context summary error:", err.message)
+        );
+
         (async () => {
           try {
             const { facts } = await extractUserFacts(trimmedMessage, fullResponseText);

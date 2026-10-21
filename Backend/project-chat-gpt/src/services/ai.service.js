@@ -267,11 +267,57 @@ AI Response: "${aiResponse || ""}"`;
   }
 }
 
+async function summarizeConversation({ previousSummary = "", olderMessages = [] }) {
+  if (!olderMessages || !Array.isArray(olderMessages) || olderMessages.length === 0) {
+    return previousSummary || "";
+  }
+
+  const formattedMessages = olderMessages
+    .map((msg) => {
+      if (!msg) return "";
+      if (typeof msg === "string") return msg.trim();
+      const role = msg.role === "user" ? "User" : "AI";
+      const text = msg.content || (msg.parts && msg.parts[0]?.text) || "";
+      return text.trim() ? `${role}: ${text.trim()}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  if (!formattedMessages.trim()) {
+    return previousSummary || "";
+  }
+
+  const prompt = `You are an AI assistant maintaining a compact rolling conversation summary for short-term memory.
+Produce a concise 2-3 sentence summary updating the discussion history with key topics, decisions, user goals, and important context.
+
+${previousSummary ? `Previous Summary:\n${previousSummary}\n\n` : ""}Older Messages to incorporate:
+${formattedMessages}
+
+Instructions:
+- Provide ONLY the updated 2-3 sentence summary.
+- Do NOT include any intro, outro, quotes, or markdown headers.`;
+
+  try {
+    const interaction = await ai.interactions.create({
+      model: "gemini-3.5-flash-lite",
+      input: prompt,
+      system_instruction: "You are an expert conversation summarizer. Produce concise, factual 2-3 sentence summaries of conversation context.",
+    });
+
+    const summary = interaction.output_text?.trim();
+    return summary || previousSummary || "";
+  } catch (error) {
+    console.error("Error summarizing conversation:", error.message);
+    return previousSummary || "";
+  }
+}
+
 module.exports = {
   generateAIResponse,
   generateAIResponseStream,
   generateVector,
   searchMemoryTool,
   extractUserFacts,
+  summarizeConversation,
 };
 

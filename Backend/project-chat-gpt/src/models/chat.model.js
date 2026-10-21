@@ -10,6 +10,14 @@ const chatSchema = new mongoose.Schema({
         type:String,
         default:"New Chat"
     },
+    contextSummary:{
+        type:String,
+        default:""
+    },
+    lastSummarizedCount:{
+        type:Number,
+        default:0
+    },
     lastActivity:{
         type:Date,
         default:Date.now
