@@ -73,7 +73,6 @@ async function* generateAIResponseStream({
 
   let currentInput = steps;
   let previousId = null;
-
   while (true) {
     const stream = await ai.interactions.create({
       model: "gemini-3.5-flash-lite",
@@ -83,7 +82,7 @@ async function* generateAIResponseStream({
       tools: activeTools,
       stream: true,
       generation_config: {
-        thinking_level: "minimal",
+        thinking_summaries: "auto",
       },
     });
 
@@ -107,8 +106,17 @@ async function* generateAIResponseStream({
       if (event.event_type === "step.delta") {
         if (event.delta?.type === "arguments_delta" || event.delta?.type === "arguments") {
           partialArgs += event.delta.arguments || event.delta.partial_arguments || "";
+        } else if (event.delta?.type === "thought_summary" || event.delta?.type === "thought") {
+          const thoughtText =
+            event.delta.content?.text ||
+            (typeof event.delta.content === "string" ? event.delta.content : "") ||
+            event.delta.text ||
+            "";
+          if (thoughtText) {
+            yield { type: "thought", text: thoughtText };
+          }
         } else if (event.delta?.type === "text" && event.delta?.text) {
-          yield event.delta.text;
+          yield { type: "text", text: event.delta.text };
         }
       }
       if (event.event_type === "interaction.completed" && event.interaction?.id) {

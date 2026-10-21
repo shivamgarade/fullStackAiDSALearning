@@ -59,8 +59,13 @@ function initSocketServer(httpServer) {
 
         const systemInstruction = "You are a helpful AI assistant. You have access to user memories and can search them with the search_memory tool when relevant.";
 
+        // Emit initial thinking status
+        socket.emit("ai-status", { chatId, status: "thinking" });
+
         // 5. Stream AI response with On-Demand Memory Retrieval (Tool Calling)
         let fullResponseText = "";
+        let currentStatus = "thinking";
+
         const responseStream = generateAIResponseStream({
           history: stm,
           prompt: trimmedMessage,
@@ -69,6 +74,7 @@ function initSocketServer(httpServer) {
             if (call.name === "search_memory") {
               socket.emit("ai-status", {
                 chatId,
+                status: "recalling_memory",
                 type: "recalling_memory",
                 message: "Searching past memories...",
               });
@@ -93,11 +99,16 @@ function initSocketServer(httpServer) {
                   .map((item) => item.metadata?.fact || item.metadata?.message)
                   .filter(Boolean);
 
-                return memoriesText.length > 0
+                const result = memoriesText.length > 0
                   ? memoriesText
                   : ["No relevant memories found in long-term memory."];
+
+                // Resume thinking state after tool completion
+                socket.emit("ai-status", { chatId, status: "thinking" });
+                return result;
               } catch (err) {
                 console.error("Error querying memory on demand:", err.message);
+                socket.emit("ai-status", { chatId, status: "thinking" });
                 return ["Error searching long-term memory."];
               }
             }
@@ -105,15 +116,43 @@ function initSocketServer(httpServer) {
           },
         });
 
-        for await (const chunk of responseStream) {
-          fullResponseText += chunk;
-          socket.emit("ai-response-chunk", {
-            chatId,
-            chunk,
-          });
+        for await (const item of responseStream) {
+          if (typeof item === "string") {
+            // Backwards compatibility for plain string chunks
+            if (currentStatus !== "responding") {
+              currentStatus = "responding";
+              socket.emit("ai-status", { chatId, status: "responding" });
+            }
+            fullResponseText += item;
+            socket.emit("ai-response-chunk", {
+              chatId,
+              chunk: item,
+            });
+          } else if (item && typeof item === "object") {
+            if (item.type === "thought") {
+              if (currentStatus !== "thinking") {
+                currentStatus = "thinking";
+                socket.emit("ai-status", { chatId, status: "thinking" });
+              }
+              socket.emit("ai-thought-chunk", {
+                chatId,
+                chunk: item.text,
+              });
+            } else if (item.type === "text") {
+              if (currentStatus !== "responding") {
+                currentStatus = "responding";
+                socket.emit("ai-status", { chatId, status: "responding" });
+              }
+              fullResponseText += item.text;
+              socket.emit("ai-response-chunk", {
+                chatId,
+                chunk: item.text,
+              });
+            }
+          }
         }
 
-        // 5. Save the complete message once in MongoDB
+        // 5. Save the complete message once in MongoDB (thoughts are NOT saved)
         const responseAiMessage = await Message.create({
           chatId,
           role: "model",
@@ -126,7 +165,10 @@ function initSocketServer(httpServer) {
           message: responseAiMessage,
         });
 
-        // 7. Background Worker: Fact Extraction for Long-Term Memory (Non-blocking)
+        // 7. Transition status to idle
+        socket.emit("ai-status", { chatId, status: "idle" });
+
+        // 8. Background Worker: Fact Extraction for Long-Term Memory (Non-blocking)
         (async () => {
           try {
             const { facts } = await extractUserFacts(trimmedMessage, fullResponseText);
@@ -155,6 +197,7 @@ function initSocketServer(httpServer) {
 
       } catch (error) {
         console.error("Error generating AI response:", error.message);
+        socket.emit("ai-status", { chatId: data?.chatId, status: "idle" });
         socket.emit("error", { message: "Failed to generate response" });
       }
     });
