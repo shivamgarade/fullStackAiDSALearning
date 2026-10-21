@@ -30,52 +30,72 @@ function initSocketServer(httpServer) {
     socket.on("ai-message", async (data) => {
       try {
         const { chatId, message } = data;
+        const trimmedMessage = (message || "").trim();
 
-        // 1. Check if the message has substance (skip pure greetings / empty acknowledgments)
-        const isGreeting = /^(hi|hello|hey|ok|okay|bye|thanks|thank you|good morning|good night)$/i.test(message.trim());
-        const hasSubstance = message.trim().length > 8 && !isGreeting;
-
-        const vectorsPromise = generateVector(message);
-
-        const [chatHistory, memory, userMessage, vectors] = await Promise.all([
-          // finding last 10 msg for stm
-          Message.find({ chatId }).sort({ createdAt: -1 }).limit(10),
-
-          // Only query Pinecone if message is not a pure greeting
-          !isGreeting
-            ? vectorsPromise.then((vecs) =>
-                queryMemory({
-                  queryVector: vecs,
-                  limit: 3,
-                  metadata: { user: socket.user._id.toString() }
-                })
-              )
-            : Promise.resolve([]),
-
-          // saving user message in mongodb
-          Message.create({
-            chatId,
-            role: "user",
-            content: message
-          }),
-
-          // resolving vectors to use in createMemory below
-          vectorsPromise
-        ]);
-
-        // Save to Pinecone ONLY if the user message has substance (skips greetings / noise)
-        if (hasSubstance) {
-          createMemory({
-            vectors,
-            messageId: userMessage._id.toString(),
-            metadata: {
-              chat: chatId,
-              user: socket.user._id.toString(),
-              role: 'user',
-              message
-            }
-          }).catch((err) => console.error("Background LTM save error:", err));
+        if (!trimmedMessage) {
+          return;
         }
+
+        // 1. Asynchronously persist user message in MongoDB (Fire-and-forget, non-blocking)
+        const userMessagePromise = Message.create({
+          chatId,
+          role: "user",
+          content: trimmedMessage,
+        }).catch((err) => console.error("Error saving user message to MongoDB:", err.message));
+
+        // 2. Determine substance for long-term memory
+        const isGreeting = /^(hi|hello|hey|ok|okay|bye|thanks|thank you|good morning|good night)$/i.test(trimmedMessage);
+        const hasSubstance = trimmedMessage.length > 8 && !isGreeting;
+
+        // 3. Asynchronously persist to Pinecone (Fire-and-forget, non-blocking)
+        if (hasSubstance) {
+          (async () => {
+            try {
+              const [userMsgDoc, vectors] = await Promise.all([
+                userMessagePromise,
+                generateVector(trimmedMessage),
+              ]);
+              if (userMsgDoc && vectors) {
+                await createMemory({
+                  vectors,
+                  messageId: userMsgDoc._id.toString(),
+                  metadata: {
+                    chat: chatId,
+                    user: socket.user._id.toString(),
+                    role: "user",
+                    message: trimmedMessage,
+                  },
+                });
+              }
+            } catch (err) {
+              console.error("Background LTM save error:", err.message);
+            }
+          })();
+        }
+
+        // 4. Parallel fetch: Ultra-fast STM (MongoDB) + Reliable LTM (Pinecone)
+        const stmPromise = Message.find({ chatId }, { role: 1, content: 1 })
+          .sort({ _id: -1 })
+          .limit(10)
+          .lean();
+
+        const ltmPromise = hasSubstance
+          ? (async () => {
+              try {
+                const queryVector = await generateVector(trimmedMessage);
+                return await queryMemory({
+                  queryVector,
+                  limit: 6,
+                  metadata: { user: socket.user._id.toString() },
+                });
+              } catch (err) {
+                console.error("LTM query error:", err.message);
+                return [];
+              }
+            })()
+          : Promise.resolve([]);
+
+        const [chatHistory, memory] = await Promise.all([stmPromise, ltmPromise]);
 
         chatHistory.reverse();
 
@@ -85,10 +105,15 @@ function initSocketServer(httpServer) {
           content: [{ type: "text", text: msg.content }],
         }));
 
-        // 3. Build system instruction with high-confidence LTM context only (score >= 0.70)
+        // 3. Build system instruction with high-confidence LTM context (score >= 0.60, excluding self-matches)
         let systemInstruction = "You are a helpful AI assistant.";
         if (memory && memory.length > 0) {
-          const relevantMemories = memory.filter((item) => typeof item.score === "number" ? item.score >= 0.7 : true);
+          const relevantMemories = memory.filter((item) => {
+            // Exclude current message self-matches
+            if (item.metadata?.message === trimmedMessage) return false;
+            return typeof item.score === "number" ? item.score >= 0.60 : true;
+          });
+
           const memoriesText = relevantMemories
             .map((item) => item.metadata?.message)
             .filter(Boolean)
@@ -103,7 +128,7 @@ function initSocketServer(httpServer) {
         let fullResponseText = "";
         const responseStream = generateAIResponseStream({
           history: stm,
-          prompt: message,
+          prompt: trimmedMessage,
           systemInstruction,
         });
 

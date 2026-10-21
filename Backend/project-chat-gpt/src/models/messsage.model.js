@@ -8,7 +8,8 @@ const messageSchema = new mongoose.Schema({
     chatId:{
         type:mongoose.Schema.Types.ObjectId,
         ref:"chat",
-        required:true
+        required:true,
+        index: true
     },
     content:{
         type:String,
@@ -19,6 +20,8 @@ const messageSchema = new mongoose.Schema({
         enum:["user","model","system"],
         default:"user"
     }
+},{
+    timestamps:true
 })
 
 const messageModel = mongoose.model("message",messageSchema)

@@ -43,6 +43,9 @@ async function* generateAIResponseStream({ history = [], prompt, systemInstructi
     system_instruction: systemInstruction || undefined,
     store: false,
     stream: true,
+    generation_config:{
+      thinking_level:"minimal"
+    }
   });
 
   for await (const event of stream) {
