@@ -73,63 +73,65 @@ function initSocketServer(httpServer) {
           })();
         }
 
-        // 4. Parallel fetch: Ultra-fast STM (MongoDB) + Reliable LTM (Pinecone)
-        const stmPromise = Message.find({ chatId }, { role: 1, content: 1 })
+        // 4. Fetch Short-Term Memory (STM) from MongoDB
+        const chatHistory = await Message.find({ chatId }, { role: 1, content: 1 })
           .sort({ _id: -1 })
           .limit(10)
           .lean();
 
-        const ltmPromise = hasSubstance
-          ? (async () => {
-              try {
-                const queryVector = await generateVector(trimmedMessage);
-                return await queryMemory({
-                  queryVector,
-                  limit: 6,
-                  metadata: { user: socket.user._id.toString() },
-                });
-              } catch (err) {
-                console.error("LTM query error:", err.message);
-                return [];
-              }
-            })()
-          : Promise.resolve([]);
-
-        const [chatHistory, memory] = await Promise.all([stmPromise, ltmPromise]);
-
         chatHistory.reverse();
 
-        // 2. Transform into Gemini Interactions API expected step format
+        // Transform into Gemini Interactions API expected step format
         const stm = chatHistory.map((msg) => ({
           type: msg.role === "user" ? "user_input" : "model_output",
           content: [{ type: "text", text: msg.content }],
         }));
 
-        // 3. Build system instruction with high-confidence LTM context (score >= 0.60, excluding self-matches)
-        let systemInstruction = "You are a helpful AI assistant.";
-        if (memory && memory.length > 0) {
-          const relevantMemories = memory.filter((item) => {
-            // Exclude current message self-matches
-            if (item.metadata?.message === trimmedMessage) return false;
-            return typeof item.score === "number" ? item.score >= 0.60 : true;
-          });
+        const systemInstruction = "You are a helpful AI assistant. You have access to user memories and can search them with the search_memory tool when relevant.";
 
-          const memoriesText = relevantMemories
-            .map((item) => item.metadata?.message)
-            .filter(Boolean)
-            .join("\n");
-
-          if (memoriesText) {
-            systemInstruction += `\n\nRelevant past information about this user:\n${memoriesText}\nUse this context when relevant, but do not recite it verbatim.`;
-          }
-        }
-
-        // 4. Stream AI response chunks in real-time
+        // 5. Stream AI response with On-Demand Memory Retrieval (Tool Calling)
         let fullResponseText = "";
         const responseStream = generateAIResponseStream({
           history: stm,
           prompt: trimmedMessage,
           systemInstruction,
+          onFunctionCall: async (call) => {
+            if (call.name === "search_memory") {
+              socket.emit("ai-status", {
+                chatId,
+                type: "recalling_memory",
+                message: "Searching past memories...",
+              });
+
+              try {
+                const searchQuery = call.arguments?.query || trimmedMessage;
+                const queryVector = await generateVector(searchQuery);
+                const memory = await queryMemory({
+                  queryVector,
+                  limit: 6,
+                  metadata: { user: socket.user._id.toString() },
+                });
+
+                const relevantMemories = (memory || []).filter((item) => {
+                  // Exclude current message self-matches
+                  if (item.metadata?.message === trimmedMessage) return false;
+                  return typeof item.score === "number" ? item.score >= 0.60 : true;
+                });
+
+                const memoriesText = relevantMemories
+                  .map((item) => item.metadata?.message)
+                  .filter(Boolean);
+
+                return memoriesText.length > 0
+                  ? memoriesText
+                  : ["No relevant memories found in long-term memory."];
+              } catch (err) {
+                console.error("Error querying memory on demand:", err.message);
+                return ["Error searching long-term memory."];
+              }
+            }
+            return "Tool not recognized.";
+          },
         });
 
         for await (const chunk of responseStream) {
