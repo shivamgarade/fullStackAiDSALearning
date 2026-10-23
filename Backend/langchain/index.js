@@ -11,9 +11,11 @@ const model = new ChatGoogleGenerativeAI({
 
 const prompTemplate = PromptTemplate.fromTemplate(`
     you are a helpful assistant.
-    Answer this question {question}
+    Answer this {question}
     avoid unnecessary jargon make the answer as consise as possible
     `)
+const chain = prompTemplate.pipe(model)
 
-prompTemplate.invoke({ question: "what is express in backend." }).then(respone => { console.log(respone.value) })
-
+chain.invoke({question:"what is express in backend answer in one line ?"}).then(response => {
+    console.log(response)
+})
